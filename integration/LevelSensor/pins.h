@@ -10,4 +10,6 @@
 #define LTE_TX_PIN D4
 #define LTE_RX_PIN D5
 
+#define SD_CS_PIN D6
+
 #endif
