@@ -1,6 +1,6 @@
 #include <HardwareSerial.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 
 #include "src/OctaveModbusWrapper/ESP32/OctaveModbusWrapper.h"
 //#include "src/SIM7600Wrapper/SIM7600Wrapper.h"
@@ -11,37 +11,51 @@
 #define SIM_BAUDRATE 115200
 #define BMS_BAUDRATE 9600
 
-// XIAO ESP32-C3 SPI: D8=SCK, D9=MISO, D10=MOSI.
-// Connect the SD module's CS pin to D6 (GPIO21).
+// Connect the SD module's CS pin to D5 (GPIO6).
 const uint32_t SD_RETRY_INTERVAL_MS = 30000UL;
-const char *CSV_PATH = "/datos.csv";
+const char *CSV_PATH = "datos.csv";
 const char *CSV_HEADER = "uptime_ms,signed_current_flow,net_signed_volume,water_height_m,flow_samples,volume_samples,height_samples";
+SdFat sd;
 bool sdReady = false;
 uint32_t lastSdRetryMs = 0UL;
 
 bool initSD() {
-  SPI.begin(D8, D9, D10, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN, SPI, 4000000)) {
-    Serial.println("SD initialization failed; measurements will continue.");
-    return false;
-  }
-
-  File csv = SD.open(CSV_PATH, FILE_APPEND);
-  if (!csv) {
-    Serial.println("Could not open datos.csv.");
-    SD.end();
-    return false;
-  }
-  if (csv.size() == 0) {
-    csv.println(CSV_HEADER);
-    if (csv.getWriteError()) {
-      Serial.println("Could not write the CSV header.");
-      csv.close();
-      SD.end();
+  SPI.begin(7, 8, 9, SD_CS_PIN);
+  if (!sd.begin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(25)))) {
+    Serial.println("SD initialization failed at 25 MHz; retrying at 4 MHz.");
+    sd.printSdError(&Serial);
+    sd.end();
+    if (!sd.begin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(4)))) {
+      Serial.println("SD initialization failed; measurements will continue.");
+      sd.printSdError(&Serial);
+      sd.end();
       return false;
     }
   }
-  csv.close();
+
+  SdFile csv;
+  if (!csv.open(CSV_PATH, O_CREAT | O_WRITE | O_APPEND)) {
+    Serial.println("Could not open datos.csv.");
+    sd.printSdError(&Serial);
+    sd.end();
+    return false;
+  }
+  if (csv.fileSize() == 0) {
+    csv.println(CSV_HEADER);
+    if (csv.getWriteError() || !csv.sync()) {
+      Serial.println("Could not write the CSV header.");
+      csv.close();
+      sd.printSdError(&Serial);
+      sd.end();
+      return false;
+    }
+  }
+  if (!csv.close()) {
+    Serial.println("Could not close datos.csv.");
+    sd.printSdError(&Serial);
+    sd.end();
+    return false;
+  }
   Serial.println("SD ready: /datos.csv");
   return true;
 }
@@ -50,9 +64,10 @@ bool appendCSV(uint32_t timestampMs,
                bool flowValid, int16_t flowX100, int flowSamples,
                bool volumeValid, int32_t volumeX100, int volumeSamples,
                bool heightValid, int16_t heightCm, int heightSamples) {
-  File csv = SD.open(CSV_PATH, FILE_APPEND);
-  if (!csv) {
+  SdFile csv;
+  if (!csv.open(CSV_PATH, O_CREAT | O_WRITE | O_APPEND)) {
     Serial.println("Could not append to datos.csv.");
+    sd.printSdError(&Serial);
     return false;
   }
 
@@ -70,9 +85,12 @@ bool appendCSV(uint32_t timestampMs,
   csv.print(',');
   csv.println(heightSamples);
 
-  bool ok = !csv.getWriteError();
-  csv.close();
-  if (!ok) Serial.println("SD write failed.");
+  bool ok = !csv.getWriteError() && csv.sync();
+  ok = csv.close() && ok;
+  if (!ok) {
+    Serial.println("SD write failed.");
+    sd.printSdError(&Serial);
+  }
   return ok;
 }
 
@@ -348,7 +366,7 @@ void loop() {
                               flowValid, avgSignedCurrentFlow, flowSamples,
                               volumeValid, avgNetSignedVolume, volumeSamples,
                               heightValid, avgWaterHeight, heightSamples);
-          if (!sdReady) SD.end();
+          if (!sdReady) sd.end();
         }
         
         // Restart time counter
