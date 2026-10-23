@@ -1,9 +1,10 @@
 #include <HardwareSerial.h>
 #include <SPI.h>
 #include <SdFat.h>
+#define TINY_GSM_MODEM_SIM7600
+#include <TinyGsmClient.h>
 
 #include "src/OctaveModbusWrapper/ESP32/OctaveModbusWrapper.h"
-//#include "src/SIM7600Wrapper/SIM7600Wrapper.h"
 #include "frequencies.h"
 #include "pins.h"
 
@@ -18,6 +19,77 @@ const char *CSV_HEADER = "uptime_ms,signed_current_flow,net_signed_volume,water_
 SdFat sd;
 bool sdReady = false;
 uint32_t lastSdRetryMs = 0UL;
+
+// RS485 uses UART1, so the SIM7600 must use the independent UART2.
+HardwareSerial LTE(2);
+TinyGsm modem(LTE);
+TinyGsmClient lteClient(modem);
+const char *LTE_APN = "internet.ideasclaro";
+const uint32_t LTE_RETRY_INTERVAL_MS = 30000UL;
+const uint32_t LTE_PROBE_INTERVAL_MS = 60000UL;
+uint32_t lastLteAttemptMs = 0UL;
+uint32_t lastLteProbeMs = 0UL;
+bool lteConnected = false;
+
+bool connectLTE() {
+  if (!modem.testAT(1000L)) {
+    Serial.println("LTE: no AT response from SIM7600.");
+    return false;
+  }
+  if (!modem.init()) {
+    Serial.println("LTE: modem initialization failed; check SIM/PIN.");
+    return false;
+  }
+  if (!modem.waitForNetwork(10000L)) {
+    Serial.println("LTE: mobile network registration failed.");
+    return false;
+  }
+  Serial.print("LTE: operator = ");
+  Serial.println(modem.getOperator());
+  Serial.print("LTE: signal quality (CSQ) = ");
+  Serial.println(modem.getSignalQuality());
+  if (!modem.gprsConnect(LTE_APN, "", "")) {
+    Serial.println("LTE: mobile data activation failed; check Claro APN.");
+    return false;
+  }
+  Serial.print("LTE: mobile data active, IP = ");
+  Serial.println(modem.localIP());
+  return true;
+}
+
+// A plain HTTP request confirms that packets can leave through the SIM.
+// No sensor readings or credentials are sent to the test host.
+void probeLTE() {
+  const char *host = "example.com";
+  if (!lteClient.connect(host, 80, 10)) {
+    Serial.println("LTE: HTTP test connection failed.");
+    lteConnected = false;
+    return;
+  }
+  lteClient.print("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+  lteClient.setTimeout(5000);
+  String status = lteClient.readStringUntil('\n');
+  status.trim();
+  lteClient.stop(1000L);
+  Serial.print("LTE: HTTP test response = ");
+  Serial.println(status.length() ? status : "(no response)");
+  if (!status.startsWith("HTTP/1.1 200") && !status.startsWith("HTTP/1.0 200")) {
+    lteConnected = false;
+  }
+}
+
+void serviceLTE(uint32_t now) {
+  if (lteConnected && now - lastLteProbeMs < LTE_PROBE_INTERVAL_MS) return;
+  if (!lteConnected && now - lastLteAttemptMs < LTE_RETRY_INTERVAL_MS) return;
+
+  if (!lteConnected || !modem.isGprsConnected()) {
+    lastLteAttemptMs = millis();
+    lteConnected = connectLTE();
+    if (!lteConnected) return;
+  }
+  lastLteProbeMs = millis();
+  probeLTE();
+}
 
 bool initSD() {
   SPI.begin(7, 8, 9, SD_CS_PIN);
@@ -251,6 +323,10 @@ void setup() {
   sdReady = initSD();
   lastSdRetryMs = millis();
 
+  LTE.begin(SIM_BAUDRATE, SERIAL_8N1, LTE_RX_PIN, LTE_TX_PIN);
+  Serial.println("LTE: SIM7600 UART2 started; first network test in 30 seconds.");
+  lastLteAttemptMs = millis();
+
   // Wait 500ms for Modbus startup
   delay(500);
 }
@@ -372,4 +448,7 @@ void loop() {
         // Restart time counter
         loggingTimeCounter = currentMillis;
     }
+
+    // Keep the cellular test independent of the sensor and SD paths.
+    serviceLTE(millis());
 }
